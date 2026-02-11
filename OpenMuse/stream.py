@@ -675,3 +675,214 @@ def stream(
                 f.close()
             except Exception:
                 pass
+
+def stream_usb(
+    port: str,
+    baud: int = 115200,
+    duration: Optional[float] = None,
+    clock_model: str = "windowed",
+    verbose: bool = True,
+):
+    """
+    Stream Muse data over USB and push to LSL.
+    Handles native USB JSON encoding format.
+    Fully symmetric with BLE clock + jitter buffer pipeline.
+    """
+
+    import serial
+    import json
+    import numpy as np
+    import time
+    from mne_lsl.lsl import local_clock
+    from .utils import configure_lsl_api_cfg
+
+    configure_lsl_api_cfg()
+
+    if verbose:
+        print(f"Opening USB port {port} at {baud} baud...")
+
+    ser = serial.Serial(port, baud, timeout=2, write_timeout=2)
+
+    def send(cmd, delay=0.2):
+        ser.write(cmd.encode("ascii"))
+        ser.write(b"\r\n")
+        ser.flush()
+        time.sleep(delay)
+
+    # Initialize Muse
+    send("")
+    send("-v")
+    send("-p1034")
+    send("-dc001")
+    send("-s")
+
+    # ---- Stream State (same structure as BLE) ----
+    streams: Dict[str, SensorStream] = {}
+    last_flush_time = time.monotonic()
+    samples_sent = {"EEG": 0, "ACCGYRO": 0, "OPTICS": 0, "BATTERY": 0}
+    start_time = time.monotonic()
+
+    # ---------------------------------------------------------
+    # Internal shared pipeline (identical logic to BLE)
+    # ---------------------------------------------------------
+
+    def _queue_samples(sensor_type: str, data_array: np.ndarray, lsl_now: float):
+        if data_array.size == 0:
+            return
+
+        stream = streams.get(sensor_type)
+        if stream is None:
+            return
+
+        device_times = data_array[:, 0]
+        samples = data_array[:, 1:]
+
+        if samples.shape[1] != stream.outlet.n_channels:
+            if verbose:
+                print(f"[USB:{sensor_type}] Channel mismatch")
+            return
+
+        last_device_time = device_times[-1]
+        stream.clock.update(last_device_time, lsl_now)
+
+        if last_device_time > stream.last_update_device_time:
+            stream.last_update_device_time = last_device_time
+
+        lsl_timestamps = stream.clock.map_time(device_times)
+        stream.buffer.append((lsl_timestamps, samples))
+
+    def _flush_buffer():
+        nonlocal last_flush_time
+        last_flush_time = time.monotonic()
+
+        for sensor_type, stream in streams.items():
+            if not stream.buffer:
+                continue
+
+            all_ts = np.concatenate([ts for ts, _ in stream.buffer])
+            all_samples = np.concatenate([s for _, s in stream.buffer])
+            stream.buffer.clear()
+
+            order = np.argsort(all_ts)
+            sorted_ts = all_ts[order]
+            sorted_samples = all_samples[order]
+
+            stream.outlet.push_chunk(
+                x=sorted_samples.astype(np.float32, copy=False),
+                timestamp=sorted_ts.astype(np.float64, copy=False),
+                pushThrough=True,
+            )
+
+            samples_sent[sensor_type] += len(sorted_samples)
+
+    # ---------------------------------------------------------
+    # USB decoding logic
+    # ---------------------------------------------------------
+
+    SENSOR_MAP = {
+        "EEG": ("EEG", 256.0),
+        "IMU": ("ACCGYRO", 52.0),
+        "OPTICS": ("OPTICS", 64.0),
+        "FG": ("BATTERY", 0.2),
+    }
+
+    try:
+        while True:
+
+            if duration and (time.monotonic() - start_time) > duration:
+                break
+
+            raw = ser.readline().decode("utf-8", errors="ignore")
+            if not raw:
+                continue
+
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start == -1 or end == -1:
+                continue
+
+            try:
+                packet = json.loads(raw[start:end + 1])
+            except json.JSONDecodeError:
+                continue
+
+            sensor_id = packet.get("id")
+            hex_samples = packet.get("sample")
+
+            if sensor_id not in SENSOR_MAP or not hex_samples:
+                continue
+
+            sensor_type, sfreq = SENSOR_MAP[sensor_id]
+
+            # Convert hex → signed integers
+            values = np.array([int(x, 16) for x in hex_samples], dtype=np.int32)
+
+            # Handle 16-bit and 20-bit signed
+            if values.max() > 0xFFFF:
+                # 20-bit signed (OPTICS)
+                values = np.where(values >= 0x80000, values - 0x100000, values)
+            else:
+                # 16-bit signed
+                values = np.where(values >= 0x8000, values - 0x10000, values)
+
+            # Determine channel count dynamically
+            if sensor_type == "EEG":
+                n_channels = 4 if len(values) % 4 == 0 else 8
+            elif sensor_type == "ACCGYRO":
+                n_channels = 6
+            elif sensor_type == "OPTICS":
+                n_channels = 16
+            else:
+                n_channels = 1
+
+            samples = values.reshape(-1, n_channels)
+
+            # Create stream outlet if needed
+            if sensor_type not in streams:
+                streams[sensor_type] = create_stream_outlet(
+                    sensor_type=sensor_type,
+                    n_channels=n_channels,
+                    device_name="MuseUSB",
+                    device_id=port,
+                    clock_model=clock_model,
+                )
+
+            stream = streams[sensor_type]
+
+            # Generate continuous device timestamps
+            n_samples = samples.shape[0]
+
+            if not hasattr(stream, "usb_device_time"):
+                stream.usb_device_time = 0.0
+
+            device_times = (
+                stream.usb_device_time
+                + np.arange(n_samples) / sfreq
+            )
+
+            stream.usb_device_time = device_times[-1] + (1.0 / sfreq)
+
+            data_array = np.column_stack([device_times, samples])
+
+            lsl_now = local_clock()
+            _queue_samples(sensor_type, data_array, lsl_now)
+
+            if (
+                time.monotonic() - last_flush_time > FLUSH_INTERVAL
+                or any(len(s.buffer) > MAX_BUFFER_PACKETS for s in streams.values())
+            ):
+                _flush_buffer()
+
+    except KeyboardInterrupt:
+        if verbose:
+            print("Stopping USB stream...")
+
+    finally:
+        _flush_buffer()
+        send("-h")
+        ser.close()
+
+        if verbose:
+            elapsed = time.monotonic() - start_time
+            print(f"[USB] Stream stopped after {elapsed:.1f}s")
+            print(f"[USB] Total samples sent: {samples_sent}")

@@ -3,6 +3,7 @@ import sys
 
 from .muse import find_muse
 from .record import record
+from .stream import stream, stream_usb
 
 
 def _add_find_args(parser: argparse.ArgumentParser) -> None:
@@ -150,6 +151,66 @@ def main(argv=None):
         return 0
 
     p_stream.set_defaults(func=handle_stream)
+
+    # stream_usb subcommand
+    p_stream_usb = subparsers.add_parser(
+        "stream_usb",
+        help="Stream Muse data over USB and push to LSL",
+    )
+
+    p_stream_usb.add_argument(
+        "--port",
+        required=True,
+        help="Serial port (e.g., COM7 or /dev/ttyUSB0)",
+    )
+
+    p_stream_usb.add_argument(
+        "--baud",
+        type=int,
+        default=115200,
+        help="Baud rate (default: 115200)",
+    )
+
+    p_stream_usb.add_argument(
+        "--duration",
+        "-d",
+        type=float,
+        default=None,
+        help="Optional stream duration in seconds",
+    )
+
+    p_stream_usb.add_argument(
+        "--clock",
+        default="windowed",
+        choices=[
+            "adaptive",
+            "constrained",
+            "robust",
+            "standard",
+            "windowed",
+            "windowed2",
+            "windowed5",
+            "windowed10",
+            "windowed15",
+            "windowed30",
+            "windowed45",
+            "windowed60",
+        ],
+        help="Clock synchronization model (default: windowed)",
+    )
+
+    def handle_stream_usb(ns):
+        stream_usb(
+            port=ns.port,
+            baud=ns.baud,
+            duration=ns.duration,
+            clock_model=ns.clock,
+            verbose=True,
+        )
+        return 0
+
+    p_stream_usb.set_defaults(func=handle_stream_usb)
+
 
     # view subcommand
     p_view = subparsers.add_parser(

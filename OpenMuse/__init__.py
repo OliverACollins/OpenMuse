@@ -4,7 +4,7 @@ from .decode import decode_rawdata, parse_message
 from .muse import find_muse
 from .muse import MuseS
 from .record import record
-from .stream import stream
+from .stream import stream, stream_usb
 from .view import view
 from .drift_correction import correct_timestamps, DriftInfo
 
