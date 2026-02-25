@@ -546,10 +546,12 @@ def stream(
 
 def stream_usb(
     port: str,
+    preset: str = "p21", # default preset for BLE
     baud: int = 115200,
     duration: Optional[float] = None,
     clock_model: str = "windowed",
     verbose: bool = True,
+    sensors: Optional[List[str]] = None,
 ):
     """
     Stream Muse data over USB and push to LSL.
@@ -563,6 +565,13 @@ def stream_usb(
     from mne_lsl.lsl import local_clock
 
     configure_lsl_api_cfg()
+
+    # Default to all sensors if not specified
+    if sensors is None:
+        sensors = ["EEG", "ACCGYRO", "OPTICS", "BATTERY"]
+    else:
+        sensors = [s.upper() for s in sensors]
+
 
     if verbose:
         print(f"Opening USB port {port} at {baud} baud...")
@@ -584,17 +593,56 @@ def stream_usb(
     # Enter CLI mode
     send("")
     send("-v")
+    send("-s1")
 
-    # Flush CLI output
-    for _ in range(5):
+    device_mac = port  # fallback
+    device_name = "MuseS"
+
+    json_buffer = ""
+    collecting = False
+
+    for _ in range(30):
         line = ser.readline()
-        if verbose and line:
-            print("CLI:", line.decode(errors="ignore").strip())
+        if not line:
+            continue
+
+        decoded = line.decode(errors="ignore").strip()
+        if verbose:
+            print("CLI:", decoded)
+
+        # Remove leading RAW/CLI noise
+        if "{" in decoded:
+            collecting = True
+            json_buffer = decoded[decoded.find("{"):]
+
+        elif collecting:
+            json_buffer += decoded
+
+        if collecting and "}" in decoded:
+            try:
+                info = json.loads(json_buffer)
+
+                if "ma" in info:
+                    if verbose:
+                        print("Computing MAC address...")
+                    device_mac = info["ma"]
+                if "hn" in info:
+                    device_name = info["hn"]
+
+            except Exception:
+                pass
+
+            collecting = False
+            json_buffer = ""
+
+    
+    device_mac = device_mac.replace("-", ":").upper()
+    device_label = f"{device_mac} | {port}"
+
 
     # Start streaming
-    send("-p1034")
+    send(f"-{preset}")
     send("-dc001")
-    send("-s")
 
     if verbose:
         print("USB streaming started.")
@@ -613,8 +661,9 @@ def stream_usb(
     # ------------------------------------------------------------------
 
     def _queue_samples(sensor_type: str, data_array: np.ndarray, lsl_now: float):
-        if data_array.size == 0:
+        if data_array.size == 0 or data_array.ndim != 2 or data_array.shape[1] < 2:
             return
+
 
         stream = streams.get(sensor_type)
         if stream is None:
@@ -623,11 +672,22 @@ def stream_usb(
         device_times = data_array[:, 0]
         samples = data_array[:, 1:]
 
+        expected_channels = stream.outlet.n_channels
+        if samples.shape[1] != expected_channels:
+            if verbose:
+                print(
+                    f"[USB:{sensor_type}] Channel mismatch: "
+                    f"{samples.shape[1]} vs expected {expected_channels}"
+                )
+            return
+
+
         last_device_time = device_times[-1]
-        stream.clock.update(last_device_time, lsl_now)
 
         if last_device_time > stream.last_update_device_time:
+            stream.clock.update(last_device_time, lsl_now)
             stream.last_update_device_time = last_device_time
+
 
         lsl_timestamps = stream.clock.map_time(device_times)
 
@@ -711,47 +771,135 @@ def stream_usb(
             else:
                 continue
 
-            # ----------------------------------------------------------
-            # Convert HEX samples → numeric values
-            # ----------------------------------------------------------
-
-            try:
-                values = np.array(
-                    [int(x, 16) for x in sample_hex],
-                    dtype=np.float32,
-                )
-            except Exception:
+            if sensor_type not in sensors:
                 continue
 
-            values = values.reshape(1, -1)
+            # --------------------------------------------------
+            # DIRECT USB DECODE (Correct Structural Symmetry)
+            # --------------------------------------------------
+
+            if sensor_id == "IMU":
+                sensor_type = "ACCGYRO"
+                sfreq = 52.0
+
+                # Convert hex → uint16
+                raw_vals = np.array([int(x, 16) for x in sample_hex], dtype=np.uint16)
+
+                # Convert to signed int16
+                raw_vals = raw_vals.view(np.int16)
+
+                # Split channels
+                acc_raw = raw_vals[0:3]
+                gyro_raw = raw_vals[3:6]
+
+                # Muse scaling factors
+                acc = acc_raw / 16384.0
+                gyro = gyro_raw / 131.0
+
+                values = np.concatenate((acc, gyro)).reshape(1, 6).astype(np.float32)
+
+            elif sensor_id == "EEG":
+                sensor_type = "EEG"
+                sfreq = 256.0
+
+                from .decode import EEG_SCALE
+
+                raw_vals = np.array([int(x, 16) for x in sample_hex], dtype=np.uint16)
+
+                # Apply 14-bit mask
+                eeg_data = (raw_vals & 0x3FFF).astype(np.float32)
+                eeg_data -= 8192.0
+                eeg_scaled = eeg_data * EEG_SCALE
+
+                # USB layout:
+                # 0: EEG_01 (ignore)
+                # 1: EEG_02 (ignore)
+                # 2: TP9
+                # 3: AF7
+                # 4: AF8
+                # 5: TP10
+                # 6: AUX1
+                # 7: AUX2
+                # 8: AUX3
+                # 9: AUX4
+
+                TP9   = eeg_scaled[2]
+                AF7   = eeg_scaled[3]
+                AF8   = eeg_scaled[4]
+                TP10  = eeg_scaled[5]
+
+                AUX1  = eeg_scaled[6]
+                AUX2  = eeg_scaled[7]
+                AUX3  = eeg_scaled[8]
+                AUX4  = eeg_scaled[9]
+
+                # BLE canonical order (no FZ shown if BLE preset doesn’t use it)
+                values = np.array(
+                    [[TP9, AF7, AF8, TP10, AUX1, AUX2, AUX3, AUX4]],
+                    dtype=np.float32
+                )
+
+
+            elif sensor_id == "OPTICS":
+                sensor_type = "OPTICS"
+                sfreq = 64.0
+
+                # 20-bit values → must use uint32
+                raw_vals = np.array([int(x, 16) for x in sample_hex], dtype=np.uint32)
+
+                optics_scaled = raw_vals.astype(np.float32) * (1.0 / 32768.0)
+
+                values = optics_scaled.reshape(1, 16)
+
+
+            elif sensor_id == "FG":
+                sensor_type = "BATTERY"
+                sfreq = 0.2
+
+                raw_vals = np.array([int(x, 16) for x in sample_hex], dtype=np.uint16)
+
+                raw_soc = raw_vals[0]           # first word = SOC
+                battery_percent = raw_soc / 256.0
+
+                values = np.array([[battery_percent]], dtype=np.float32)
+
+
+            else:
+                continue
+
+
 
             # ----------------------------------------------------------
             # Create LSL stream if needed
             # ----------------------------------------------------------
 
-            if sensor_type not in streams:
+            # Create stream if needed
+            if sensor_type not in streams and sensor_type in sensors:
                 streams[sensor_type] = create_stream_outlet(
                     sensor_type=sensor_type,
                     n_channels=values.shape[1],
                     device_name="MuseUSB",
-                    device_id=port,
+                    device_id=device_label,
                     clock_model=clock_model,
                 )
 
-            stream = streams[sensor_type]
+            stream = streams.get(sensor_type)
+            if stream is None:
+                continue
 
-            # ----------------------------------------------------------
-            # Generate continuous device time
-            # ----------------------------------------------------------
+            # --------------------------------------------------
+            # Generate synthetic device_time (BLE-equivalent layer)
+            # --------------------------------------------------
 
-            if not hasattr(stream, "usb_device_time"):
-                stream.usb_device_time = 0.0
+            if not hasattr(stream, "usb_sample_counter"):
+                stream.usb_sample_counter = 0
 
-            device_time = stream.usb_device_time
-            stream.usb_device_time += 1.0 / sfreq
+            device_time = stream.usb_sample_counter / sfreq
+            stream.usb_sample_counter += 1
 
-            data_array = np.column_stack(
-                [[device_time], values[0]]
+            data_array = np.concatenate(
+                (np.array([[device_time]], dtype=np.float64), values),
+                axis=1
             )
 
             lsl_now = local_clock()
@@ -778,3 +926,5 @@ def stream_usb(
             elapsed = time.monotonic() - start_time
             print(f"[USB] Stream stopped after {elapsed:.1f}s")
             print(f"[USB] Total samples sent: {samples_sent}")
+            print("USB EEG raw:", raw_vals)
+            print("USB mean:", np.mean(raw_vals))

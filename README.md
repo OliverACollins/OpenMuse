@@ -77,7 +77,8 @@ data["ACCGYRO"].plot(
 
 ![](./media/example_accgyro.png)
 
-### Lab Streaming Layer (LSL)
+### Streaming Using BLE Connection
+#### Lab Streaming Layer (LSL)
 
 > [!NOTE]  
 > OpenMuse uses [MNE-LSL](https://mne.tools/mne-lsl/), an improved python-binding for the Lab Streaming Layer C++ library, `mne_lsl.lsl`, replacing `pylsl`.
@@ -95,6 +96,25 @@ The following options are available:
 - `--duration`: Duration of the recording in seconds (if not specified, streaming will continue until you press Ctrl+C in the terminal)
 - `--preset`: Preset configuration (default: `p1041` for all channels)
 - `--record`: Record raw BLE packets to a file (optional)
+
+### Streaming Through USB Connection
+#### Using OpenMuse
+
+> [!IMPORTANT]
+> The `stream_usb` function is still in development - channels mappings are not yet finalised.
+
+To stream data through USB, use:
+
+```powershell
+OpenMuse stream_usb
+```
+
+The following options are available:
+
+
+
+
+#### Using PuTTY Terminal Emulator
 
 ### Visualize Live Streams
 

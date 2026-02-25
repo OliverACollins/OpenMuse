@@ -161,7 +161,7 @@ def main(argv=None):
     p_stream_usb.add_argument(
         "--port",
         required=True,
-        help="Serial port (e.g., COM7 or /dev/ttyUSB0)",
+        help="Virtual COM port (e.g., COM7)",
     )
 
     p_stream_usb.add_argument(
@@ -173,10 +173,22 @@ def main(argv=None):
 
     p_stream_usb.add_argument(
         "--duration",
-        "-d",
         type=float,
         default=None,
         help="Optional stream duration in seconds",
+    )
+
+    p_stream_usb.add_argument(
+        "--preset",
+        default="p21",
+        help="Preset to send (default: p21 for all channels including EEG)",
+    )
+
+    p_stream_usb.add_argument(
+        "--sensors",
+        nargs="+",
+        choices=["EEG", "ACCGYRO", "OPTICS", "BATTERY"],
+        help="Specify which sensors to stream (default: all)"
     )
 
     p_stream_usb.add_argument(
@@ -200,14 +212,20 @@ def main(argv=None):
     )
 
     def handle_stream_usb(ns):
+        if ns.duration is not None and ns.duration <= 0:
+            parser.error("--duration must be positive when provided")
+
         stream_usb(
             port=ns.port,
+            preset=ns.preset,
             baud=ns.baud,
             duration=ns.duration,
             clock_model=ns.clock,
             verbose=True,
+            sensors=ns.sensors,
         )
         return 0
+
 
     p_stream_usb.set_defaults(func=handle_stream_usb)
 
